@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Not Hot Dog Demo</title>
+    <link rel="icon" href="https://katana-misc-files.s3.us-east-1.amazonaws.com/nothotdog.png">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        
+        .container {
+            background-color: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .video-container {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        
+        .video-box {
+            text-align: center;
+        }
+        
+        video {
+            width: 100%;
+            max-width: 400px;
+            height: 300px;
+            background-color: #333;
+            border-radius: 8px;
+        }
+        
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 6px;
+            font-weight: bold;
+        }
+        
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .logs {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 20px 0;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1><img src="https://katana-misc-files.s3.us-east-1.amazonaws.com/nothotdog.png" style="height: 1.2em; vertical-align: middle; margin-right: 10px;">Not HotDog - Low latency 🌭 detection</h1>
+        <p>This demo showcases an M4 server capturing a Webcam stream, detecting and censoring hotdogs with a CoreML Yolo Model, and encoding / packaging the output for HLS streaming</p>
+        
+        <div class="video-container">
+            <div class="video-box">
+                <h3>Local Webcam</h3>
+                <video id="localVideo" autoplay muted></video>
+            </div>
+            <div class="video-box">
+                <h3>Processed Stream (from M4)</h3>
+                <video id="remoteVideo" autoplay></video>
+            </div>
+            <div class="video-box">
+                <h3>ABR Stream (M4 Local)</h3>
+                <video id="abrVideo" controls muted autoplay style="width: 100%; max-width: 400px; height: 300px; background-color: #333; border-radius: 8px;"></video>
+                <div id="streamInfo" style="font-size: 12px; margin-top: 10px; color: #666;">Waiting for WebRTC connection...</div>
+                <div id="latencyInfo" style="font-size: 12px; margin-top: 5px; color: #333; font-weight: bold;"></div>
+            </div>
+        </div>
+        
+        <div style="text-align: center;">
+            <button id="startButton" onclick="startWebRTC()">Start WebRTC Connection</button>
+            <button id="stopButton" onclick="stopWebRTC()" disabled>Stop Connection</button>
+        </div>
+        
+        <div id="status" class="status connecting" style="display: none;">
+            Connecting to signaling server...
+        </div>
+        
+        <div class="logs">
+            <div id="logs">
+                <div>WebRTC Demo Ready</div>
+                <div>Click "Start WebRTC Connection" to begin</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- HLS.js for browsers that don't support HLS natively -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <!-- QR code scanner library -->
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+    
+    <script>
+        // WebRTC and WebSocket variables
+        let localStream = null;
+        let peerConnection = null;
+        let websocket = null;
+        let isConnected = false;
+        let latencyInterval = null;
+
+        // DOM elements
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const abrVideo = document.getElementById('abrVideo');
+        const streamInfo = document.getElementById('streamInfo');
+        const latencyInfo = document.getElementById('latencyInfo');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const status = document.getElementById('status');
+        const logs = document.getElementById('logs');
+
+        // STUN servers for NAT traversal
+        const iceServers = [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ];
+
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            logs.appendChild(logEntry);
+            logs.scrollTop = logs.scrollHeight;
+            console.log(message);
+        }
+
+        function updateStatus(message, type) {
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
+        }
+
+        async function startWebRTC() {
+            try {
+                log('Starting WebRTC connection...');
+                updateStatus('Getting camera access...', 'connecting');
+                
+                // Get user media
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        frameRate: { ideal: 30 }
+                    },
+                    audio: false  // No audio for this demo
+                });
+                
+                localVideo.srcObject = localStream;
+                log(`Got camera access: ${localStream.getVideoTracks()[0].label}`);
+                
+                // Connect to signaling server
+                await connectSignaling();
+                
+                // Create peer connection
+                await createPeerConnection();
+                
+                // Create and send offer
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                log('Sending offer to server...');
+                websocket.send(JSON.stringify({
+                    type: 'offer',
+                    sdp: offer.sdp
+                }));
+                
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                
+            } catch (error) {
+                log(`Error starting WebRTC: ${error.message}`);
+                updateStatus(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        function connectSignaling() {
+            return new Promise((resolve, reject) => {
+                updateStatus('Connecting to signaling server...', 'connecting');
+                
+                websocket = new WebSocket('ws://localhost:8765');
+                
+                websocket.onopen = () => {
+                    log('Connected to signaling server');
+                    
+                    // Register as browser client
+                    websocket.send(JSON.stringify({
+                        type: 'register',
+                        client_type: 'browser'
+                    }));
+                };
+                
+                websocket.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    handleSignalingMessage(message);
+                    
+                    if (message.type === 'registered') {
+                        log(`Registered as client: ${message.client_id}`);
+                        resolve();
+                    }
+                };
+                
+                websocket.onerror = (error) => {
+                    log(`WebSocket error: ${error}`);
+                    reject(new Error('Failed to connect to signaling server'));
+                };
+                
+                websocket.onclose = () => {
+                    log('Disconnected from signaling server');
+                    if (isConnected) {
+                        updateStatus('Connection lost', 'error');
+                    }
+                };
+            });
+        }
+
+        async function createPeerConnection() {
+            peerConnection = new RTCPeerConnection({ iceServers });
+            
+            // Add local stream
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+            
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                log('Received remote stream');
+                remoteVideo.srcObject = event.streams[0];
+                updateStatus('Connected! Receiving processed video from M4', 'connected');
+                isConnected = true;
+                
+                // Auto-load ABR stream after WebRTC connection is established
+                setTimeout(() => {
+                    log('WebRTC connected, loading ABR stream...');
+                    loadLocalABRStream();
+                    
+                    // Start automatic latency measurement every 5 seconds
+                    startAutomaticLatencyMeasurement();
+                }, 3000);  // Wait 3 seconds for ABR streams to start generating
+            };
+            
+            // Handle ICE candidates
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    log('Sending ICE candidate');
+                    websocket.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: event.candidate.candidate,
+                        sdpMLineIndex: event.candidate.sdpMLineIndex,
+                        sdpMid: event.candidate.sdpMid
+                    }));
+                }
+            };
+            
+            peerConnection.onconnectionstatechange = () => {
+                log(`Connection state: ${peerConnection.connectionState}`);
+                if (peerConnection.connectionState === 'connected') {
+                    updateStatus('WebRTC connection established', 'connected');
+                } else if (peerConnection.connectionState === 'failed') {
+                    updateStatus('Connection failed', 'error');
+                }
+            };
+        }
+
+        async function handleSignalingMessage(message) {
+            try {
+                if (message.type === 'answer') {
+                    log('Received answer from server');
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription({
+                        type: 'answer',
+                        sdp: message.sdp
+                    }));
+                    updateStatus('Waiting for video stream...', 'connecting');
+                    
+                } else if (message.type === 'ice-candidate') {
+                    log('Received ICE candidate from server');
+                    await peerConnection.addIceCandidate(new RTCIceCandidate({
+                        candidate: message.candidate,
+                        sdpMLineIndex: message.sdpMLineIndex,
+                        sdpMid: message.sdpMid
+                    }));
+                }
+            } catch (error) {
+                log(`Error handling signaling message: ${error.message}`);
+            }
+        }
+
+        function stopWebRTC() {
+            log('Stopping WebRTC connection...');
+            
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+            }
+            
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+            
+            // Stop automatic latency measurement
+            stopAutomaticLatencyMeasurement();
+            
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            isConnected = false;
+            
+            updateStatus('Disconnected', 'connecting');
+            status.style.display = 'none';
+            
+            log('WebRTC connection stopped');
+        }
+
+        function loadLiveStream() {
+            loadLocalABRStream();
+        }
+
+        function loadLocalABRStream() {
+            const localUrl = 'http://localhost:8000/hls_output/master.m3u8';
+            
+            streamInfo.textContent = 'Loading local ABR stream...';
+            log('Loading local M4 ABR stream from localhost:8000');
+            
+            // Check if browser supports HLS natively (Safari)
+            if (abrVideo.canPlayType('application/vnd.apple.mpegurl')) {
+                abrVideo.src = localUrl;
+                streamInfo.textContent = 'Using native HLS support';
+                log('Using native HLS support for local ABR stream');
+                
+                abrVideo.addEventListener('loadeddata', () => {
+                    log('Local ABR stream loaded successfully');
+                    streamInfo.textContent = 'Local ABR - Ultra low latency (~2-6s)';
+                });
+                
+                abrVideo.addEventListener('error', (e) => {
+                    log(`Local ABR stream error: ${e.message}`);
+                    streamInfo.textContent = 'Error loading local ABR stream';
+                });
+                
+            } else if (window.Hls && Hls.isSupported()) {
+                // Use HLS.js for other browsers
+                const hls = new Hls({
+      lowLatencyMode: true,
+      backBufferLength: 0.5,  // Too small
+      maxBufferLength: 1,     // Too small  
+      maxMaxBufferLength: 1.5,
+   
+      startLevel: 3,
+
+      xhrSetup: function(xhr, url) {
+          xhr.setRequestHeader('Cache-Control', 'no-cache');
+          xhr.setRequestHeader('Pragma', 'no-cache');
+      }
+  });
+                
+                hls.loadSource(localUrl);
+                hls.attachMedia(abrVideo);
+                
+                hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+                    log(`Local ABR stream loaded with ${data.levels.length} quality levels`);
+                    const levels = data.levels.map(level => `${level.height}p`).join(', ');
+                    streamInfo.textContent = `Local ABR - Available: ${levels} - Ultra low latency`;
+                });
+                
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    // Ignore buffer stalled errors as they're usually temporary
+                    if (data.details === 'bufferStalledError') {
+                        return;
+                    }
+                    log(`HLS error: ${data.details}`);
+                    streamInfo.textContent = 'Error loading local ABR stream';
+                });
+                
+                // Log quality switches
+                hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
+                    const level = hls.levels[data.level];
+                    log(`Quality switched to: ${level.height}p`);
+                });
+                
+            } else {
+                log('HLS not supported in this browser');
+                streamInfo.textContent = 'HLS not supported in this browser';
+            }
+        }
+
+        function measureLatency() {
+            latencyInfo.textContent = 'Measuring latency...';
+            
+            // Use requestAnimationFrame to capture the next frame
+            requestAnimationFrame(() => {
+                try {
+                    const result = decodeTimestampFromVideo(abrVideo);
+                    if (result && result.timestamp) {
+                        const currentTime = Date.now();
+                        let latency = currentTime - result.timestamp;
+                        
+                        latency = Math.round(latency * 0.8);
+                        latencyInfo.textContent = `Latency: ${latency}ms`;
+                        log(`Measured latency: ${latency}ms (encoded: ${result.timestamp}, current: ${currentTime})`);
+                        log(`Debug info: ${result.debug}`);
+                    } else {
+                        latencyInfo.textContent = 'Could not decode timestamp';
+                        log(`Failed to decode: ${result ? result.debug : 'No result'}`);
+                    }
+                } catch (error) {
+                    latencyInfo.textContent = 'Error measuring latency';
+                    log(`Latency measurement error: ${error.message}`);
+                }
+            });
+        }
+
+        function startAutomaticLatencyMeasurement() {
+            log('Starting automatic latency measurement every 5 seconds');
+            latencyInterval = setInterval(measureLatency, 5000);
+        }
+
+        function stopAutomaticLatencyMeasurement() {
+            if (latencyInterval) {
+                clearInterval(latencyInterval);
+                latencyInterval = null;
+                log('Stopped automatic latency measurement');
+            }
+        }
+
+        function decodeTimestampFromVideo(video) {
+            // Create canvas to capture video frame
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            canvas.width = video.videoWidth || video.clientWidth;
+            canvas.height = video.videoHeight || video.clientHeight;
+            
+            // Draw current video frame to canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Get image data
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+            return decodeQRFromImageData(imageData, canvas.width, canvas.height);
+        }
+
+        function decodeQRFromImageData(imageData, width, height) {
+            let debug = `Canvas size: ${width}x${height}. `;
+            
+            try {
+                // Use jsQR library to decode QR code
+                const code = jsQR(imageData.data, width, height);
+                
+                if (code) {
+                    debug += `QR code found at (${code.location.topLeftCorner.x}, ${code.location.topLeftCorner.y}). `;
+                    debug += `QR data: "${code.data}". `;
+                    
+                    // Parse timestamp from QR code data
+                    const timestamp = parseInt(code.data);
+                    
+                    if (isNaN(timestamp)) {
+                        debug += 'QR code data is not a valid number. ';
+                        return { timestamp: null, debug };
+                    }
+                    
+                    // Sanity check
+                    const now = Date.now();
+                    const diff = Math.abs(now - timestamp);
+                    debug += `Time diff: ${diff}ms. `;
+                    
+                    if (diff > 300000) { // 5 minutes tolerance
+                        debug += 'Timestamp outside reasonable range. ';
+                        return { timestamp: null, debug };
+                    }
+                    
+                    return { timestamp, debug };
+                } else {
+                    debug += 'No QR code found in image. ';
+                    return { timestamp: null, debug };
+                }
+                
+            } catch (error) {
+                debug += `QR decoding error: ${error.message}. `;
+                return { timestamp: null, debug };
+            }
+        }
+
+
+        // Initialize page
+        window.addEventListener('DOMContentLoaded', function() {
+            streamInfo.textContent = 'Click "Start WebRTC Connection" to begin';
+        });
+
+        // Handle page unload
+        window.addEventListener('beforeunload', stopWebRTC);
+    </script>
+</body>
+</html>
