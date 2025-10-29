@@ -1,4 +1,4 @@
-# Not Hot Dog - Real-time Object Detection on Apple M4
+# !🌭 - Real-time Object Detection on Apple M4
 
 A WebRTC demo showcasing Apple M4's unified memory architecture for real-time AI video processing. Detects hot dogs using CoreML YOLO models and streams with local Adaptive Bitrate (ABR) transcoding - all on a single M4 chip.
 
